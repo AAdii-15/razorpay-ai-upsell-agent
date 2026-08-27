@@ -9,6 +9,7 @@ Wraps the official SDK with:
 """
 
 import os
+import hashlib
 import razorpay
 from dotenv import load_dotenv
 
@@ -35,11 +36,19 @@ def create_payment_link(*, amount_paise: int, description: str, session_id: str,
     """
     client = get_client()
 
+    # Razorpay caps reference_id at 40 characters. A raw session_id could
+    # be arbitrarily long (this exact bug was caught live: a 28-char
+    # session_id pushed the field to 42 chars and Razorpay correctly
+    # rejected it) — hash it down to a fixed, safely-bounded length
+    # instead of concatenating the raw value.
+    session_hash = hashlib.sha256(session_id.encode()).hexdigest()[:16]
+    reference_id = f"u_{session_hash}_{os.urandom(3).hex()}"
+
     payload = {
         "amount": amount_paise,
         "currency": "INR",
         "description": description,
-        "reference_id": f"upsell_{session_id}_{os.urandom(3).hex()}",
+        "reference_id": reference_id,
         "notes": {"source": "ai_upsell_agent", "session_id": session_id},
     }
 

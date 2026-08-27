@@ -20,6 +20,9 @@ import sys
 import requests
 from google import genai
 from google.genai import types
+from dotenv import load_dotenv
+
+load_dotenv()
 
 VALID_CATEGORIES = {"accessories", "peripherals", "services"}
 
@@ -129,6 +132,10 @@ def run_scenario(base_url: str, agent_id: str, session_id: str, items: list[dict
         else:
             log(f"decision: offer was rejected by merchant policy (not my mandate): {reasons}")
             log("nothing further to do — this is the merchant's own limit, not mine to override. session complete.")
+    elif status == "failed_gracefully":
+        error = data.get("error", {})
+        log(f"decision: offer was valid and approved, but the merchant's payment system failed to process it ({error.get('error_type')}: {error.get('error_message')}).")
+        log("this is a merchant-side system failure, not a policy rejection — not retrying automatically, logging and moving on. session complete, no purchase made.")
     else:
         log(f"unexpected status '{status}' — failing safe, not acting on it.")
 
