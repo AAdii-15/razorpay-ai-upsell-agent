@@ -139,3 +139,23 @@ def test_metrics_aggregate_correctly_across_sessions(client):
     assert m["total_carts_evaluated"] == 2
     assert m["upsells_suggested"] == 1
     assert m["auto_approved_and_charged"] == 1
+
+
+def test_unknown_sku_in_cart_is_rejected(client):
+    body = {"session_id": "t_badsku", "items": [{"sku": "sku_does_not_exist", "name": "x", "qty": 1, "price_paise": 100}]}
+    r = client.post("/decide", json=body)
+    assert r.status_code == 400
+    assert "not in the merchant catalog" in r.json()["detail"]
+
+
+def test_price_mismatch_in_cart_is_rejected(client):
+    body = {"session_id": "t_badprice", "items": [{"sku": "sku_004", "name": "Mechanical Keyboard", "qty": 1, "price_paise": 1}]}
+    r = client.post("/decide", json=body)
+    assert r.status_code == 400
+    assert "price mismatch" in r.json()["detail"]
+
+
+def test_negative_quantity_rejected_at_schema_level(client):
+    body = {"session_id": "t_negqty", "items": [{"sku": "sku_004", "name": "x", "qty": -1, "price_paise": 349900}]}
+    r = client.post("/decide", json=body)
+    assert r.status_code == 422

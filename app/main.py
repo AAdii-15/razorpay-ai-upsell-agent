@@ -48,10 +48,6 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API
 
 IDEMPOTENCY_CACHE: dict[str, dict] = {}
 
-# Decisions awaiting human approval are persisted via audit.py (SQLite),
-# not held in memory — a server restart no longer silently drops a
-# transaction that's mid-approval.
-
 
 @app.get("/catalog")
 def get_catalog():
@@ -83,6 +79,16 @@ def decide(req: DecideRequest, idempotency_key: Optional[str] = Header(default=N
 
 
 def _decide_core(req: DecideRequest) -> dict:
+    for cart_item in req.items:
+        catalog_item = CATALOG.get(cart_item.sku)
+        if catalog_item is None:
+            raise HTTPException(status_code=400, detail=f"unknown SKU in cart: '{cart_item.sku}' is not in the merchant catalog")
+        if cart_item.price_paise != catalog_item["price_paise"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"price mismatch for '{cart_item.sku}': client sent {cart_item.price_paise}, catalog price is {catalog_item['price_paise']}",
+            )
+
     cart = CartContext(session_id=req.session_id, items=req.items, customer_segment=req.customer_segment)
     decision_id = str(uuid.uuid4())
 

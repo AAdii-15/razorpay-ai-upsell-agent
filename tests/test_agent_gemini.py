@@ -57,3 +57,17 @@ def test_mandate_category_filter_narrows_catalog_shown_to_llm():
         system_instruction = call_kwargs["config"].system_instruction
         assert "Extended Warranty" in system_instruction
         assert "Wireless Mouse" not in system_instruction
+
+
+def test_mandate_price_cap_also_filters_catalog_shown_to_llm():
+    mock_response = MagicMock()
+    mock_response.function_calls = []
+    mandate = BuyerMandate(caller_type="ai_agent", max_spend_paise=20000, allowed_categories=["accessories", "peripherals", "services"])
+
+    with patch.object(agent, "get_client") as mock_get:
+        mock_get.return_value.models.generate_content.return_value = mock_response
+        agent.decide_upsell(_big_cart(), mandate=mandate)
+        call_kwargs = mock_get.return_value.models.generate_content.call_args.kwargs
+        system_instruction = call_kwargs["config"].system_instruction
+        assert "Cable Organizer Kit" in system_instruction
+        assert "Wireless Mouse" not in system_instruction

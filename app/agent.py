@@ -60,7 +60,10 @@ def _catalog_for_prompt(mandate: BuyerMandate | None) -> dict:
     allowed = set(UPSELL_ALLOWED_CATEGORIES)
     if mandate and mandate.allowed_categories:
         allowed &= set(mandate.allowed_categories)
-    return {sku: item for sku, item in CATALOG.items() if item["category"] in allowed}
+    catalog = {sku: item for sku, item in CATALOG.items() if item["category"] in allowed}
+    if mandate and mandate.max_spend_paise is not None:
+        catalog = {sku: item for sku, item in catalog.items() if item["price_paise"] <= mandate.max_spend_paise}
+    return catalog
 
 
 def decide_upsell(cart: CartContext, mandate: BuyerMandate | None = None) -> UpsellSuggestion:
@@ -77,7 +80,7 @@ def decide_upsell(cart: CartContext, mandate: BuyerMandate | None = None) -> Ups
     if not catalog:
         return UpsellSuggestion(
             should_upsell=False,
-            reasoning="no catalog items available within the buyer mandate's allowed categories",
+            reasoning="no catalog items fit within the buyer mandate's allowed categories and price cap",
         )
 
     if not mandate or mandate.caller_type == "human_customer":

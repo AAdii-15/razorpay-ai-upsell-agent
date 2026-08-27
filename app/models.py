@@ -1,12 +1,12 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, Literal
 
 
 class CartItem(BaseModel):
     sku: str
     name: str
-    qty: int
-    price_paise: int
+    qty: int = Field(gt=0)
+    price_paise: int = Field(gt=0)
 
 
 class CartContext(BaseModel):
@@ -23,7 +23,7 @@ class UpsellSuggestion(BaseModel):
     should_upsell: bool
     sku: Optional[str] = None
     name: Optional[str] = None
-    discount_pct: int = 0
+    discount_pct: int = Field(default=0, ge=0, le=100)
     reasoning: str
 
 
@@ -36,7 +36,7 @@ class BuyerMandate(BaseModel):
     mandate and merchant policy, never the looser one.
     """
     caller_type: Literal["human_customer", "ai_agent"] = "human_customer"
-    max_spend_paise: Optional[int] = None
+    max_spend_paise: Optional[int] = Field(default=None, gt=0)
     allowed_categories: Optional[list[str]] = None
     agent_id: Optional[str] = None
 

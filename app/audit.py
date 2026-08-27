@@ -21,6 +21,7 @@ GENESIS_HASH = "0" * 64
 
 def _get_conn():
     conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS audit_log (
