@@ -6,19 +6,22 @@ import pytest
 
 @pytest.fixture
 def client(isolated_audit_db, monkeypatch):
-    monkeypatch.delenv("MERCHANT_API_KEY", raising=False)
     import main
     import importlib
     importlib.reload(main)
+    # Force auth off for this fixture regardless of what's in .env — reload()
+    # re-runs load_dotenv(), which would otherwise silently repopulate
+    # MERCHANT_API_KEY from disk and break every "no auth" test.
+    main.MERCHANT_API_KEY = None
     return TestClient(main.app)
 
 
 @pytest.fixture
 def authed_client(isolated_audit_db, monkeypatch):
-    monkeypatch.setenv("MERCHANT_API_KEY", "test-key-123")
     import main
     import importlib
     importlib.reload(main)
+    main.MERCHANT_API_KEY = "test-key-123"
     return TestClient(main.app), main
 
 
