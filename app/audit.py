@@ -4,7 +4,8 @@ Append-only, tamper-evident audit log.
 Every event (agent decision, guardrail check, human approval, Razorpay call,
 failure + recovery) is written here with a hash that chains to the previous
 event in the same session. If any row is edited or deleted after the fact,
-verify_chain() will detect it.
+verify_chain() will detect it — this is what makes the trail an *audit*
+trail rather than just a log file.
 """
 
 import sqlite3
@@ -36,7 +37,46 @@ def _get_conn():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_decisions (
+            decision_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            data TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
     return conn
+
+
+def save_pending_decision(decision_id: str, session_id: str, data: dict) -> None:
+    """Persisted, not in-memory — a server restart no longer silently
+    drops a decision that's awaiting human sign-off."""
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO pending_decisions (decision_id, session_id, data, created_at) VALUES (?, ?, ?, ?)",
+            (decision_id, session_id, json.dumps(data, default=str), datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def pop_pending_decision(decision_id: str) -> dict | None:
+    """Read-then-delete in one call, same 'can't double-resolve' guarantee
+    the in-memory dict.pop() gave — a second call always returns None."""
+    conn = _get_conn()
+    try:
+        row = conn.execute("SELECT data FROM pending_decisions WHERE decision_id = ?", (decision_id,)).fetchone()
+        if row is None:
+            return None
+        conn.execute("DELETE FROM pending_decisions WHERE decision_id = ?", (decision_id,))
+        conn.commit()
+        return json.loads(row[0])
+    finally:
+        conn.close()
 
 
 def _last_hash(conn, session_id: str) -> str:

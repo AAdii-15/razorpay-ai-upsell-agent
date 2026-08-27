@@ -37,10 +37,6 @@ else:
 
 app = FastAPI(title="AI Upsell Agent — Razorpay Buildathon")
 
-# Simple shared-secret auth on mutating endpoints. If MERCHANT_API_KEY is
-# unset, auth is off (local dev default) — this is intentional, not an
-# oversight, so the demo keeps working with zero extra setup; production
-# would refuse to boot without the key set at all.
 MERCHANT_API_KEY = os.environ.get("MERCHANT_API_KEY")
 
 
@@ -50,18 +46,11 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API
     if not x_api_key or not secrets.compare_digest(x_api_key, MERCHANT_API_KEY):
         raise HTTPException(status_code=401, detail="missing or invalid X-API-Key")
 
-# In-memory store for decisions awaiting human approval. A real system
-# would persist this (Redis/Postgres); acceptable simplification for a
-# buildathon demo — noted here rather than left silent.
-PENDING_DECISIONS: dict[str, dict] = {}
-
-# Idempotency cache for /decide. A retried request (network timeout, client
-# retry logic, double-tap on a slow connection) with the same key returns
-# the original result instead of re-running the pipeline — which matters
-# specifically because auto-approval calls Razorpay directly. Without this,
-# a retry after a slow-but-successful call creates a second real payment
-# link for the same intent.
 IDEMPOTENCY_CACHE: dict[str, dict] = {}
+
+# Decisions awaiting human approval are persisted via audit.py (SQLite),
+# not held in memory — a server restart no longer silently drops a
+# transaction that's mid-approval.
 
 
 @app.get("/catalog")
@@ -81,7 +70,7 @@ def decide(req: DecideRequest, idempotency_key: Optional[str] = Header(default=N
         audit.log_event(
             req.session_id, "idempotent_replay", "system",
             {"idempotency_key": idempotency_key, "original_decision_id": cached.get("decision_id")},
-            reasoning="duplicate request with a previously-seen Idempotency-Key — returned cached result instead of re-running the pipeline (prevents a duplicate Razorpay charge on retry)",
+            reasoning="duplicate request with a previously-seen Idempotency-Key — returned cached result instead of re-running the pipeline",
         )
         return {**cached, "idempotent_replay": True}
 
@@ -123,10 +112,10 @@ def _decide_core(req: DecideRequest) -> dict:
     final_price_paise = item["price_paise"] - discount_applied
 
     if guardrail.requires_human_approval:
-        PENDING_DECISIONS[decision_id] = {
-            "session_id": req.session_id, "suggestion": suggestion,
-            "item": item, "final_price_paise": final_price_paise,
-        }
+        audit.save_pending_decision(
+            decision_id, req.session_id,
+            {"session_id": req.session_id, "item": item, "final_price_paise": final_price_paise},
+        )
         audit.log_event(
             req.session_id, "pending_human_approval", "system",
             {"decision_id": decision_id, "item": item["name"], "final_price_paise": final_price_paise},
@@ -168,7 +157,7 @@ def _decide_core(req: DecideRequest) -> dict:
 
 @app.post("/decide/{decision_id}/approve", dependencies=[Depends(require_api_key)])
 def approve(decision_id: str):
-    pending = PENDING_DECISIONS.pop(decision_id, None)
+    pending = audit.pop_pending_decision(decision_id)
     if not pending:
         raise HTTPException(status_code=404, detail="decision not found or already resolved")
 
@@ -192,7 +181,7 @@ def approve(decision_id: str):
 
 @app.post("/decide/{decision_id}/reject", dependencies=[Depends(require_api_key)])
 def reject(decision_id: str):
-    pending = PENDING_DECISIONS.pop(decision_id, None)
+    pending = audit.pop_pending_decision(decision_id)
     if not pending:
         raise HTTPException(status_code=404, detail="decision not found or already resolved")
     audit.log_event(pending["session_id"], "human_rejection", "human", {"decision_id": decision_id, "approved": False})
@@ -201,11 +190,6 @@ def reject(decision_id: str):
 
 @app.get("/metrics")
 def get_metrics():
-    """
-    Aggregate stats across all sessions, derived entirely from the audit
-    log — no separate counters to keep in sync. This is the "does this
-    actually grow revenue" evidence: measured, not asserted.
-    """
     decisions = audit.get_all_events("agent_decision")
     guardrail_checks = audit.get_all_events("guardrail_check")
     orders = audit.get_all_events("razorpay_order_created")

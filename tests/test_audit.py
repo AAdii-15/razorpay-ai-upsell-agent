@@ -52,3 +52,20 @@ def test_get_all_events_filters_by_type_across_sessions(isolated_audit_db):
     assert len(decisions) == 2
     blocked = audit.get_all_events("blocked")
     assert len(blocked) == 1
+
+
+def test_pending_decisions_persist_across_a_simulated_restart(isolated_audit_db, monkeypatch):
+    """The whole point of moving this off an in-memory dict: it must
+    survive the process disappearing and a new one starting up against
+    the same database file."""
+    import audit
+    audit.save_pending_decision("dec_1", "session_x", {"item": {"name": "Wireless Mouse"}, "final_price_paise": 116910})
+
+    import importlib
+    importlib.reload(audit)
+    monkeypatch.setattr(audit, "DB_PATH", isolated_audit_db)
+
+    result = audit.pop_pending_decision("dec_1")
+    assert result is not None
+    assert result["final_price_paise"] == 116910
+    assert audit.pop_pending_decision("dec_1") is None
