@@ -4,8 +4,7 @@ Append-only, tamper-evident audit log.
 Every event (agent decision, guardrail check, human approval, Razorpay call,
 failure + recovery) is written here with a hash that chains to the previous
 event in the same session. If any row is edited or deleted after the fact,
-verify_chain() will detect it — this is what makes the trail an *audit*
-trail rather than just a log file.
+verify_chain() will detect it.
 """
 
 import sqlite3
@@ -54,9 +53,6 @@ def _compute_hash(event_id, session_id, event_type, actor, payload_json, reasoni
 
 
 def log_event(session_id: str, event_type: str, actor: str, payload: dict, reasoning: str | None = None) -> dict:
-    """
-    actor: one of 'agent' | 'guardrail' | 'human' | 'system' | 'razorpay'
-    """
     conn = _get_conn()
     try:
         event_id = str(uuid.uuid4())
@@ -101,8 +97,33 @@ def get_trail(session_id: str) -> list[dict]:
         conn.close()
 
 
+def get_all_events(event_type: str | None = None) -> list[dict]:
+    """Cross-session query, used for /metrics."""
+    conn = _get_conn()
+    try:
+        if event_type:
+            rows = conn.execute(
+                """SELECT event_id, session_id, event_type, actor, payload, reasoning, created_at
+                   FROM audit_log WHERE event_type = ? ORDER BY id ASC""",
+                (event_type,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT event_id, session_id, event_type, actor, payload, reasoning, created_at
+                   FROM audit_log ORDER BY id ASC""",
+            ).fetchall()
+        return [
+            {
+                "event_id": r[0], "session_id": r[1], "event_type": r[2],
+                "actor": r[3], "payload": json.loads(r[4]), "reasoning": r[5], "created_at": r[6],
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
 def verify_chain(session_id: str) -> dict:
-    """Recomputes every hash to confirm no row was altered or deleted after the fact."""
     conn = _get_conn()
     try:
         rows = conn.execute(

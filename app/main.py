@@ -13,10 +13,12 @@ the pipeline doesn't know or care which one produced the suggestion.
 import sys
 import os
 import uuid
+import secrets
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fastapi import FastAPI, HTTPException
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Header, Depends
 from dotenv import load_dotenv
 
 from models import DecideRequest, CartContext
@@ -35,7 +37,31 @@ else:
 
 app = FastAPI(title="AI Upsell Agent — Razorpay Buildathon")
 
+# Simple shared-secret auth on mutating endpoints. If MERCHANT_API_KEY is
+# unset, auth is off (local dev default) — this is intentional, not an
+# oversight, so the demo keeps working with zero extra setup; production
+# would refuse to boot without the key set at all.
+MERCHANT_API_KEY = os.environ.get("MERCHANT_API_KEY")
+
+
+def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
+    if not MERCHANT_API_KEY:
+        return
+    if not x_api_key or not secrets.compare_digest(x_api_key, MERCHANT_API_KEY):
+        raise HTTPException(status_code=401, detail="missing or invalid X-API-Key")
+
+# In-memory store for decisions awaiting human approval. A real system
+# would persist this (Redis/Postgres); acceptable simplification for a
+# buildathon demo — noted here rather than left silent.
 PENDING_DECISIONS: dict[str, dict] = {}
+
+# Idempotency cache for /decide. A retried request (network timeout, client
+# retry logic, double-tap on a slow connection) with the same key returns
+# the original result instead of re-running the pipeline — which matters
+# specifically because auto-approval calls Razorpay directly. Without this,
+# a retry after a slow-but-successful call creates a second real payment
+# link for the same intent.
+IDEMPOTENCY_CACHE: dict[str, dict] = {}
 
 
 @app.get("/catalog")
@@ -48,8 +74,26 @@ def get_cart_scenarios():
     return CART_SCENARIOS
 
 
-@app.post("/decide")
-def decide(req: DecideRequest):
+@app.post("/decide", dependencies=[Depends(require_api_key)])
+def decide(req: DecideRequest, idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key")):
+    if idempotency_key and idempotency_key in IDEMPOTENCY_CACHE:
+        cached = IDEMPOTENCY_CACHE[idempotency_key]
+        audit.log_event(
+            req.session_id, "idempotent_replay", "system",
+            {"idempotency_key": idempotency_key, "original_decision_id": cached.get("decision_id")},
+            reasoning="duplicate request with a previously-seen Idempotency-Key — returned cached result instead of re-running the pipeline (prevents a duplicate Razorpay charge on retry)",
+        )
+        return {**cached, "idempotent_replay": True}
+
+    result = _decide_core(req)
+
+    if idempotency_key:
+        IDEMPOTENCY_CACHE[idempotency_key] = result
+
+    return result
+
+
+def _decide_core(req: DecideRequest) -> dict:
     cart = CartContext(session_id=req.session_id, items=req.items, customer_segment=req.customer_segment)
     decision_id = str(uuid.uuid4())
 
@@ -122,7 +166,7 @@ def decide(req: DecideRequest):
         }
 
 
-@app.post("/decide/{decision_id}/approve")
+@app.post("/decide/{decision_id}/approve", dependencies=[Depends(require_api_key)])
 def approve(decision_id: str):
     pending = PENDING_DECISIONS.pop(decision_id, None)
     if not pending:
@@ -146,13 +190,45 @@ def approve(decision_id: str):
         return {"status": "approved_but_razorpay_failed", "error": result}
 
 
-@app.post("/decide/{decision_id}/reject")
+@app.post("/decide/{decision_id}/reject", dependencies=[Depends(require_api_key)])
 def reject(decision_id: str):
     pending = PENDING_DECISIONS.pop(decision_id, None)
     if not pending:
         raise HTTPException(status_code=404, detail="decision not found or already resolved")
     audit.log_event(pending["session_id"], "human_rejection", "human", {"decision_id": decision_id, "approved": False})
     return {"status": "rejected"}
+
+
+@app.get("/metrics")
+def get_metrics():
+    """
+    Aggregate stats across all sessions, derived entirely from the audit
+    log — no separate counters to keep in sync. This is the "does this
+    actually grow revenue" evidence: measured, not asserted.
+    """
+    decisions = audit.get_all_events("agent_decision")
+    guardrail_checks = audit.get_all_events("guardrail_check")
+    orders = audit.get_all_events("razorpay_order_created")
+    blocked = audit.get_all_events("blocked")
+    pending = audit.get_all_events("pending_human_approval")
+    failed = audit.get_all_events("razorpay_call_failed")
+
+    total_carts_evaluated = len(decisions)
+    upsells_suggested = sum(1 for e in decisions if e["payload"]["suggestion"]["should_upsell"])
+    total_revenue_paise = sum(e["payload"].get("amount_paise", 0) for e in orders)
+
+    return {
+        "total_carts_evaluated": total_carts_evaluated,
+        "upsells_suggested": upsells_suggested,
+        "suggestion_rate": round(upsells_suggested / total_carts_evaluated, 3) if total_carts_evaluated else 0,
+        "guardrail_checks_run": len(guardrail_checks),
+        "auto_approved_and_charged": len(orders),
+        "blocked_by_guardrails": len(blocked),
+        "routed_to_human_approval": len(pending),
+        "razorpay_call_failures": len(failed),
+        "total_revenue_from_upsells_paise": total_revenue_paise,
+        "total_revenue_from_upsells_rupees": round(total_revenue_paise / 100, 2),
+    }
 
 
 @app.get("/audit/{session_id}")
@@ -162,7 +238,7 @@ def get_audit(session_id: str):
     return {"session_id": session_id, "events": trail, "chain_verification": verification}
 
 
-@app.post("/demo/simulate-failure")
+@app.post("/demo/simulate-failure", dependencies=[Depends(require_api_key)])
 def simulate_failure(session_id: str = "failure_demo"):
     result = razorpay_client.create_payment_link(
         amount_paise=100, description="failure demo", session_id=session_id, simulate_failure=True,
