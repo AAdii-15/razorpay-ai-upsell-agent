@@ -135,8 +135,10 @@ Also: SQLite now runs in WAL mode (`PRAGMA journal_mode=WAL`), since the origina
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, GEMINI_API_KEY (or ANTHROPIC_API_KEY + LLM_BACKEND=claude)
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --reload --reload-exclude "audit.db*" --port 8000
 ```
+
+**Note on `--reload-exclude`:** SQLite's WAL mode (enabled in this project for concurrency) writes to companion files (`audit.db-wal`, `audit.db-shm`) on every single request. Without excluding these, uvicorn's dev-mode file watcher can in principle detect its own database writes as "code changed" and restart the server mid-request. This flag prevents that. **For recording the pitch video specifically, skip `--reload` entirely** (`uvicorn app.main:app --port 8000`) — reload is a dev-convenience feature for auto-restarting on code edits, which you won't be doing during a take, so there's no reason to carry any risk of it during a recording.
 
 Interactive API docs: `localhost:8000/docs`. Standalone buyer-agent demo (needs `GEMINI_API_KEY`): `python3 buyer_agent.py`. Test suite: `pytest tests/ -v`.
 
