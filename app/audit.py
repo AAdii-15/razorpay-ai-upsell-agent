@@ -66,15 +66,20 @@ def save_pending_decision(decision_id: str, session_id: str, data: dict) -> None
 
 
 def pop_pending_decision(decision_id: str) -> dict | None:
-    """Read-then-delete in one call, same 'can't double-resolve' guarantee
-    the in-memory dict.pop() gave — a second call always returns None."""
+    """Read-then-delete in ONE atomic SQL statement (DELETE...RETURNING),
+    not two separate statements. Two concurrent /approve calls for the
+    same decision_id previously had a real race window — both could
+    SELECT the row before either DELETEd it, causing a double Razorpay
+    charge. RETURNING closes that window at the SQLite level."""
     conn = _get_conn()
     try:
-        row = conn.execute("SELECT data FROM pending_decisions WHERE decision_id = ?", (decision_id,)).fetchone()
+        row = conn.execute(
+            "DELETE FROM pending_decisions WHERE decision_id = ? RETURNING data",
+            (decision_id,),
+        ).fetchone()
+        conn.commit()
         if row is None:
             return None
-        conn.execute("DELETE FROM pending_decisions WHERE decision_id = ?", (decision_id,))
-        conn.commit()
         return json.loads(row[0])
     finally:
         conn.close()
@@ -94,6 +99,9 @@ def _compute_hash(event_id, session_id, event_type, actor, payload_json, reasoni
 
 
 def log_event(session_id: str, event_type: str, actor: str, payload: dict, reasoning: str | None = None) -> dict:
+    """
+    actor: one of 'agent' | 'guardrail' | 'human' | 'system' | 'razorpay'
+    """
     conn = _get_conn()
     try:
         event_id = str(uuid.uuid4())
@@ -139,7 +147,9 @@ def get_trail(session_id: str) -> list[dict]:
 
 
 def get_all_events(event_type: str | None = None) -> list[dict]:
-    """Cross-session query, used for /metrics."""
+    """Cross-session query, used for /metrics. Unlike get_trail(), this is
+    not scoped to one session — it's for aggregate reporting, not for the
+    tamper-evidence guarantee (which is only meaningful per-chain)."""
     conn = _get_conn()
     try:
         if event_type:
@@ -165,6 +175,7 @@ def get_all_events(event_type: str | None = None) -> list[dict]:
 
 
 def verify_chain(session_id: str) -> dict:
+    """Recomputes every hash to confirm no row was altered or deleted after the fact."""
     conn = _get_conn()
     try:
         rows = conn.execute(

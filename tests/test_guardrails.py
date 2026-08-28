@@ -35,32 +35,42 @@ def test_no_upsell_suggestion_always_approved_trivially():
 
 
 def test_ai_agent_has_stricter_approval_threshold_than_human():
-    """Same item, same price, same cart — human gets auto-approved,
-    AI agent gets routed to human review, because the thresholds differ."""
-    s = UpsellSuggestion(should_upsell=True, sku="sku_007", discount_pct=5, reasoning="x")  # ₹399
+    s = UpsellSuggestion(should_upsell=True, sku="sku_007", discount_pct=5, reasoning="x")
     g_human = guardrails.check_suggestion(cart_total_paise=500000, suggestion=s, mandate=None)
     mandate = BuyerMandate(caller_type="ai_agent", max_spend_paise=50000, agent_id="bot-1")
     g_agent = guardrails.check_suggestion(cart_total_paise=500000, suggestion=s, mandate=mandate)
 
-    assert g_human.approved and g_human.requires_human_approval  # ₹399 >= ₹300 human threshold
-    assert g_agent.approved and g_agent.requires_human_approval  # ₹399 >= ₹150 AI threshold too
+    assert g_human.approved and g_human.requires_human_approval
+    assert g_agent.approved and g_agent.requires_human_approval
     assert "human-initiated" in g_human.reasons[0]
     assert "AI-agent-initiated" in g_agent.reasons[0]
 
 
 def test_mandate_cap_overrides_otherwise_valid_merchant_approval():
-    """The merchant's own policy would allow this item, but the buyer
-    agent's declared mandate is stricter — mandate wins."""
-    s = UpsellSuggestion(should_upsell=True, sku="sku_007", discount_pct=5, reasoning="x")  # ₹399
-    mandate = BuyerMandate(caller_type="ai_agent", max_spend_paise=20000, agent_id="cheap-bot")  # ₹200 cap
+    s = UpsellSuggestion(should_upsell=True, sku="sku_007", discount_pct=5, reasoning="x")
+    mandate = BuyerMandate(caller_type="ai_agent", max_spend_paise=20000, agent_id="cheap-bot")
     g = guardrails.check_suggestion(cart_total_paise=500000, suggestion=s, mandate=mandate)
     assert not g.approved
     assert "mandate cap" in g.reasons[0]
 
 
 def test_mandate_category_restriction_enforced():
-    s = UpsellSuggestion(should_upsell=True, sku="sku_006", discount_pct=0, reasoning="warranty upsell")  # services
+    s = UpsellSuggestion(should_upsell=True, sku="sku_006", discount_pct=0, reasoning="warranty upsell")
     mandate = BuyerMandate(caller_type="ai_agent", max_spend_paise=200000, allowed_categories=["accessories"], agent_id="bot-2")
     g = guardrails.check_suggestion(cart_total_paise=500000, suggestion=s, mandate=mandate)
     assert not g.approved
     assert "allowed categories" in g.reasons[0]
+
+
+def test_daily_budget_within_cap_passes():
+    within, reason = guardrails.check_daily_budget(this_amount_paise=10000, todays_auto_approved_total_paise=100000)
+    assert within is True
+
+
+def test_daily_budget_exceeded_fails():
+    within, reason = guardrails.check_daily_budget(
+        this_amount_paise=10000,
+        todays_auto_approved_total_paise=guardrails.DAILY_AUTO_APPROVE_BUDGET_PAISE,
+    )
+    assert within is False
+    assert "daily auto-approve budget" in reason

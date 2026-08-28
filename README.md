@@ -1,5 +1,7 @@
 # AI Upsell Agent — Razorpay AI Buildathon, Track 01 (AI Growth & Agentic Commerce)
 
+![System overview](docs/images/system-overview.png)
+
 An upsell-decision service with two callers on the same trust boundary: a human checkout and an autonomous AI buyer agent. Both go through identical LLM reasoning, identical deterministic enforcement, and identical audit logging — but the AI-agent path carries a stricter auto-approval ceiling and an additional caller-declared spending mandate, because no human observes that transaction in real time.
 
 Track bar, quoted directly from `razorpay.com/buildathon`: *"Every money action explainable, bounded and gated. Show the audit trail and one failure handled gracefully."* Every section below maps to a clause in that sentence.
@@ -9,7 +11,7 @@ Track bar, quoted directly from `razorpay.com/buildathon`: *"Every money action 
 | Criterion | Where |
 |---|---|
 | Problem Taste | Two callers, one enforcement boundary, differentiated risk posture — not a single-path upsell bot. `README §Mandate design`. |
-| Build Quality | 34 automated tests (`tests/`), CI on every push, curated dependency list, structured error handling with no unhandled 500s, input validation at the schema layer. |
+| Build Quality | 43 automated tests (`tests/`), CI on every push, exact-pinned dependencies, structured error handling with no unhandled 500s, input validation at the schema layer, two race conditions found and fixed under real concurrent load — not just claimed safe. |
 | AI Judgment | LLM is the only non-deterministic component on the merchant side (`app/agent_gemini.py`), gated by static Python (`app/guardrails.py`) it cannot see or influence. `buyer_agent.py` makes exactly one real LLM call — interpreting a natural-language brief into a numeric mandate — then is deliberately deterministic afterward; re-litigating a financial boundary with another model call per response is a judgment call that should not be delegated. Both sides have an explicit "skip the LLM" rule (`should_call_agent()` for trivial carts). |
 | Failure Recovery | `POST /demo/simulate-failure` — real Razorpay 400 on an invalid payload, caught, logged, recovered without a 500. `app/razorpay_client.py` never raises to its caller. |
 
@@ -52,6 +54,10 @@ Two independent auto-approval ceilings exist because AI-initiated purchases carr
 
 Same LLM call, same cart, same suggested item, two different real outcomes depending solely on caller identity — reproduced against the live system, not synthesized for this document:
 
+![Sequence diagram: same suggestion, two outcomes](docs/images/sequence-diagram.png)
+
+Mermaid source for the same sequence (renders natively on GitHub too, and is the version that's actually verifiable against plain text rather than a static image):
+
 ```mermaid
 sequenceDiagram
     participant HC as Human checkout
@@ -79,18 +85,19 @@ sequenceDiagram
 
 ## Architecture
 app/
-├── main.py FastAPI orchestration: routing, auth, idempotency, metrics, cart validation
+├── main.py FastAPI orchestration: routing, auth, rate limiting, idempotency (race-safe), metrics, cart validation, daily budget
 ├── agent_gemini.py LLM reasoning (Gemini). Only non-deterministic component on the merchant side.
 ├── agent.py Same interface, Claude backend — LLM_BACKEND=claude in .env
 ├── guardrails.py Deterministic enforcement. Never sees the LLM's prompt or reasoning.
-├── audit.py Hash-chained SQLite log (WAL mode) + persisted pending-decision store
+├── audit.py Hash-chained SQLite log (WAL mode) + persisted, race-safe pending-decision store
 ├── razorpay_client.py Razorpay Test Mode wrapper — structured failures, never raises
 ├── mock_data.py Demo merchant catalog + cart scenarios
 └── models.py Pydantic schemas with input-bound validation (qty>0, price>0, 0<=discount<=100)
 
 buyer_agent.py Standalone autonomous AI buyer — one real LLM call, deterministic after
-tests/ 34 pytest tests, mocked LLM/Razorpay, run in CI
+tests/ 43 pytest tests, mocked LLM/Razorpay, run in CI
 live_checks/ Scripts that hit real Gemini/Claude/Razorpay — not in CI (need real keys)
+docs/images/ Diagram assets referenced in this README
 .github/workflows/ CI: pytest on every push
 
 ## Safety & control
@@ -103,9 +110,11 @@ live_checks/ Scripts that hit real Gemini/Claude/Razorpay — not in CI (need re
 | Max upsell price | ₹1,500 | `guardrails.py` |
 | Human-approval threshold, human caller | ≥ ₹300 | `guardrails.py` |
 | Human-approval threshold, AI-agent caller | ≥ ₹150 | `guardrails.py` |
+| Daily aggregate auto-approve budget | ₹5,000/day across ALL auto-approved transactions | `guardrails.py` + `main.py` |
 | Buyer mandate cap / category scope | caller-declared, intersected with merchant policy | `guardrails.py` + prompt-level pre-filter |
 | Unknown SKU | rejected unconditionally | `guardrails.py` |
-| Idempotent replay | same `Idempotency-Key` → cached result, zero re-execution | `main.py` |
+| Idempotent replay | same `Idempotency-Key` → cached result, zero re-execution, race-safe under concurrent identical requests | `main.py` |
+| Rate limiting | 30 requests/minute per API key on `/decide` | `main.py` |
 | Shared-secret auth | `X-API-Key` on all mutating routes | `main.py` |
 
 None of the above lives in a prompt. All of it runs after the LLM has already responded, and cart/schema validation runs before it's even called.
@@ -120,6 +129,17 @@ After the first working version, I re-reviewed the codebase adversarially — th
 4. **No input bounds on quantity, price, or discount.** A negative quantity or discount was schema-valid before. Fixed with `Field(gt=0)` / `Field(ge=0, le=100)` constraints — malformed input now fails at the schema layer with a 422, before touching business logic.
 
 Also: SQLite now runs in WAL mode (`PRAGMA journal_mode=WAL`), since the original default mode degrades under concurrent access.
+
+## Final hardening — concurrency and production readiness
+
+A second adversarial pass, specifically looking for what a payments-company reviewer checks by reflex, found two real concurrency bugs and two previously-disclosed-but-unfixed gaps:
+
+1. **Double-charge race in `/decide/{id}/approve`.** `pop_pending_decision()` used a separate SELECT then DELETE — two concurrent approval calls for the same `decision_id` could both read the row before either deleted it, both firing a real Razorpay payment. Fixed with an atomic `DELETE ... RETURNING` in one SQL statement. **Proven, not argued:** `tests/test_audit.py::test_pop_pending_decision_is_atomic_under_real_concurrency` fires 20 real threads at the same pending decision; exactly one succeeds, every time.
+2. **Double-execution race on idempotent retries.** The original lock only guarded the dict read/write, not the full check-execute-store sequence — two concurrent requests with the same `Idempotency-Key` could both pass the "not cached yet" check before either finished. Fixed by holding the lock across the entire pipeline run for keyed requests. Proven the same way: `tests/test_api.py::test_idempotency_lock_holds_under_real_concurrent_requests` fires 10 real concurrent threads with an artificially widened race window; the LLM is called exactly once.
+3. **Daily aggregate spend cap**, closing a gap disclosed but left open in the previous pass: many small auto-approved transactions could individually pass every per-transaction check while cumulatively exceeding what a merchant would actually tolerate in a day. `guardrails.check_daily_budget()` now catches this — `main.py` sums today's already-approved spend and routes to human approval if a new auto-approval would cross ₹5,000/day, even when the transaction alone looks fine.
+4. **Rate limiting on `/decide`**, the other previously-disclosed gap: a simple in-memory sliding window, 30 requests/minute per API key, tested for both the threshold itself and that different keys get independent buckets.
+
+Also: `GET /health` added for uptime monitoring, and `requirements.txt` now pins exact tested versions (`==`) instead of open-ended `>=` ranges — a loose lower bound doesn't protect against a future breaking release.
 
 ## Audit trail
 
@@ -144,7 +164,6 @@ Interactive API docs: `localhost:8000/docs`. Standalone buyer-agent demo (needs 
 
 ## Known limitations, disclosed rather than hidden
 
-- No rate limiting on any endpoint — a real deployment needs this; scoped out here rather than shipped half-tested.
-- `IDEMPOTENCY_CACHE` is in-memory and unbounded — a restart loses replay protection for in-flight retries (not approved transactions; those are persisted separately in `pending_decisions`), and long-running processes would eventually want an eviction policy.
-- No per-day aggregate spend cap across auto-approved transactions — each is bounded individually, not cumulatively.
+- `IDEMPOTENCY_CACHE` is in-memory and unbounded — a restart loses replay protection for in-flight retries (not approved transactions; those are persisted separately in `pending_decisions`), and a long-running process would eventually want an eviction policy.
 - Single hardcoded merchant catalog — no multi-tenant policy storage.
+- Rate limiting is a single-instance in-memory sliding window — correct and tested for this deployment shape, but would need a shared store (Redis) behind a load balancer with multiple instances.

@@ -22,6 +22,23 @@ MAX_UPSELL_PCT_OF_CART = 0.60                  # upsell can't exceed 60% of exis
 HUMAN_APPROVAL_THRESHOLD_PAISE = 300_00        # human checkout: >= ₹300 needs sign-off
 AI_AGENT_APPROVAL_THRESHOLD_PAISE = 150_00     # AI-agent buyer: >= ₹150 needs sign-off
 
+# Per-transaction caps above don't catch many small transactions
+# cumulatively draining the merchant's risk budget in a single day.
+# This is a separate, additive check — main.py sums today's already
+# auto-approved spend and passes it in here; this function stays pure
+# and testable without needing to query the audit log itself.
+DAILY_AUTO_APPROVE_BUDGET_PAISE = 5000_00      # Rs.5,000/day across ALL auto-approved transactions
+
+
+def check_daily_budget(this_amount_paise: int, todays_auto_approved_total_paise: int) -> tuple[bool, str]:
+    projected_total = todays_auto_approved_total_paise + this_amount_paise
+    if projected_total > DAILY_AUTO_APPROVE_BUDGET_PAISE:
+        return False, (
+            f"daily auto-approve budget would be exceeded: "
+            f"Rs.{projected_total/100:.2f} projected vs Rs.{DAILY_AUTO_APPROVE_BUDGET_PAISE/100:.2f} cap — routed to human approval instead"
+        )
+    return True, "within daily auto-approve budget"
+
 
 def check_suggestion(cart_total_paise: int, suggestion, mandate: BuyerMandate | None = None) -> GuardrailResult:
     reasons: list[str] = []

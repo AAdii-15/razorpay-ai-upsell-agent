@@ -14,6 +14,10 @@ import sys
 import os
 import uuid
 import secrets
+import threading
+import time
+from collections import defaultdict, deque
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -47,6 +51,32 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API
         raise HTTPException(status_code=401, detail="missing or invalid X-API-Key")
 
 IDEMPOTENCY_CACHE: dict[str, dict] = {}
+IDEMPOTENCY_LOCK = threading.Lock()
+
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_MAX_REQUESTS = 30
+_rate_limit_lock = threading.Lock()
+_rate_limit_buckets: dict[str, deque] = defaultdict(deque)
+
+
+def enforce_rate_limit(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
+    bucket_key = x_api_key or "anonymous"
+    now = time.monotonic()
+    with _rate_limit_lock:
+        bucket = _rate_limit_buckets[bucket_key]
+        while bucket and now - bucket[0] > RATE_LIMIT_WINDOW_SECONDS:
+            bucket.popleft()
+        if len(bucket) >= RATE_LIMIT_MAX_REQUESTS:
+            raise HTTPException(
+                status_code=429,
+                detail=f"rate limit exceeded: max {RATE_LIMIT_MAX_REQUESTS} requests per {RATE_LIMIT_WINDOW_SECONDS}s per API key",
+            )
+        bucket.append(now)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 @app.get("/catalog")
@@ -59,23 +89,24 @@ def get_cart_scenarios():
     return CART_SCENARIOS
 
 
-@app.post("/decide", dependencies=[Depends(require_api_key)])
+@app.post("/decide", dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)])
 def decide(req: DecideRequest, idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key")):
-    if idempotency_key and idempotency_key in IDEMPOTENCY_CACHE:
-        cached = IDEMPOTENCY_CACHE[idempotency_key]
-        audit.log_event(
-            req.session_id, "idempotent_replay", "system",
-            {"idempotency_key": idempotency_key, "original_decision_id": cached.get("decision_id")},
-            reasoning="duplicate request with a previously-seen Idempotency-Key — returned cached result instead of re-running the pipeline",
-        )
-        return {**cached, "idempotent_replay": True}
+    if not idempotency_key:
+        return _decide_core(req)
 
-    result = _decide_core(req)
+    with IDEMPOTENCY_LOCK:
+        if idempotency_key in IDEMPOTENCY_CACHE:
+            cached = IDEMPOTENCY_CACHE[idempotency_key]
+            audit.log_event(
+                req.session_id, "idempotent_replay", "system",
+                {"idempotency_key": idempotency_key, "original_decision_id": cached.get("decision_id")},
+                reasoning="duplicate request with a previously-seen Idempotency-Key — returned cached result instead of re-running the pipeline (prevents a duplicate Razorpay charge on retry)",
+            )
+            return {**cached, "idempotent_replay": True}
 
-    if idempotency_key:
+        result = _decide_core(req)
         IDEMPOTENCY_CACHE[idempotency_key] = result
-
-    return result
+        return result
 
 
 def _decide_core(req: DecideRequest) -> dict:
@@ -98,7 +129,7 @@ def _decide_core(req: DecideRequest) -> dict:
         audit.log_event(
             req.session_id, "agent_call_failed", "system",
             {"decision_id": decision_id, "error": str(e)},
-            reasoning="LLM call raised an exception (timeout, rate limit, or SDK error) -- failing safe with no upsell attempt instead of crashing the request.",
+            reasoning="LLM call raised an exception (timeout, rate limit, or SDK error) — failing safe with no upsell attempt instead of crashing the request.",
         )
         return {
             "decision_id": decision_id, "status": "agent_call_failed",
@@ -130,7 +161,24 @@ def _decide_core(req: DecideRequest) -> dict:
     discount_applied = int(item["price_paise"] * suggestion.discount_pct / 100)
     final_price_paise = item["price_paise"] - discount_applied
 
-    if guardrail.requires_human_approval:
+    requires_human = guardrail.requires_human_approval
+    if not requires_human:
+        today_str = datetime.now(timezone.utc).date().isoformat()
+        todays_total_paise = sum(
+            e["payload"].get("amount_paise", 0)
+            for e in audit.get_all_events("razorpay_order_created")
+            if e["created_at"].startswith(today_str)
+        )
+        within_budget, budget_reason = guardrails.check_daily_budget(final_price_paise, todays_total_paise)
+        if not within_budget:
+            requires_human = True
+            audit.log_event(
+                req.session_id, "daily_budget_exceeded", "guardrail",
+                {"decision_id": decision_id, "todays_total_paise": todays_total_paise, "this_amount_paise": final_price_paise},
+                reasoning=budget_reason,
+            )
+
+    if requires_human:
         audit.save_pending_decision(
             decision_id, req.session_id,
             {"session_id": req.session_id, "item": item, "final_price_paise": final_price_paise},

@@ -9,9 +9,6 @@ def client(isolated_audit_db, monkeypatch):
     import main
     import importlib
     importlib.reload(main)
-    # Force auth off for this fixture regardless of what's in .env — reload()
-    # re-runs load_dotenv(), which would otherwise silently repopulate
-    # MERCHANT_API_KEY from disk and break every "no auth" test.
     main.MERCHANT_API_KEY = None
     return TestClient(main.app)
 
@@ -142,9 +139,6 @@ def test_metrics_aggregate_correctly_across_sessions(client):
 
 
 def test_llm_exception_fails_safe_instead_of_500(client):
-    """If the LLM call raises for any reason (timeout, rate limit, SDK
-    error), the request must still return a clean response, never an
-    unhandled crash."""
     import main
     with patch.object(main.agent_module, "decide_upsell") as mock_decide:
         mock_decide.side_effect = TimeoutError("simulated LLM timeout")
@@ -172,3 +166,99 @@ def test_negative_quantity_rejected_at_schema_level(client):
     body = {"session_id": "t_negqty", "items": [{"sku": "sku_004", "name": "x", "qty": -1, "price_paise": 349900}]}
     r = client.post("/decide", json=body)
     assert r.status_code == 422
+
+
+def test_health_endpoint_is_public_and_returns_ok(client):
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+
+
+def test_rate_limit_returns_429_after_threshold(client, monkeypatch):
+    import main
+    monkeypatch.setattr(main, "RATE_LIMIT_MAX_REQUESTS", 3)
+    main._rate_limit_buckets.clear()
+
+    with patch.object(main.agent_module, "decide_upsell") as mock_decide:
+        mock_decide.return_value = UpsellSuggestion(should_upsell=False, reasoning="x")
+        statuses = []
+        for i in range(5):
+            r = client.post("/decide", json=_cart_body(f"t_ratelimit_{i}"))
+            statuses.append(r.status_code)
+
+    assert statuses[:3] == [200, 200, 200], f"first 3 requests should succeed, got {statuses}"
+    assert 429 in statuses[3:], f"4th or 5th request should be rate-limited, got {statuses}"
+
+
+def test_rate_limit_buckets_are_independent_per_api_key(client, monkeypatch):
+    import main
+    monkeypatch.setattr(main, "RATE_LIMIT_MAX_REQUESTS", 2)
+    main._rate_limit_buckets.clear()
+
+    with patch.object(main.agent_module, "decide_upsell") as mock_decide:
+        mock_decide.return_value = UpsellSuggestion(should_upsell=False, reasoning="x")
+        for i in range(2):
+            r = client.post("/decide", json=_cart_body(f"t_keya_{i}"), headers={"X-API-Key": "key-a"})
+            assert r.status_code == 200
+        r = client.post("/decide", json=_cart_body("t_keya_over"), headers={"X-API-Key": "key-a"})
+        assert r.status_code == 429
+
+        r = client.post("/decide", json=_cart_body("t_keyb"), headers={"X-API-Key": "key-b"})
+        assert r.status_code == 200, "a different API key must not share the exhausted bucket"
+
+
+def test_daily_auto_approve_budget_routes_to_human_once_exceeded(client, monkeypatch):
+    import main
+    monkeypatch.setattr(main, "RATE_LIMIT_MAX_REQUESTS", 100)
+    main._rate_limit_buckets.clear()
+
+    with patch.object(main.agent_module, "decide_upsell") as mock_decide, \
+         patch.object(main.razorpay_client, "create_payment_link") as mock_rzp:
+        mock_decide.return_value = UpsellSuggestion(should_upsell=True, sku="sku_009", discount_pct=0, reasoning="x")
+        mock_rzp.return_value = {"ok": True, "payment_link": {"short_url": "https://rzp.io/i/budget"}}
+
+        statuses = []
+        for i in range(40):
+            r = client.post("/decide", json=_cart_body(f"t_budget_{i}"))
+            statuses.append(r.json()["status"])
+
+    assert "auto_approved" in statuses, "early transactions should still auto-approve"
+    assert "pending_human_approval" in statuses, "later transactions must get bumped to human approval once the daily cap is threatened"
+
+
+def test_idempotency_lock_holds_under_real_concurrent_requests(client):
+    import main
+    import threading
+
+    call_count = {"n": 0}
+    call_lock = threading.Lock()
+
+    def slow_decide(cart, mandate=None):
+        with call_lock:
+            call_count["n"] += 1
+        import time as _time
+        _time.sleep(0.05)
+        return UpsellSuggestion(should_upsell=True, sku="sku_009", discount_pct=0, reasoning="x")
+
+    with patch.object(main.agent_module, "decide_upsell", side_effect=slow_decide), \
+         patch.object(main.razorpay_client, "create_payment_link") as mock_rzp:
+        mock_rzp.return_value = {"ok": True, "payment_link": {"short_url": "https://rzp.io/i/concurrent"}}
+
+        headers = {"Idempotency-Key": "concurrent-test-key"}
+        results = []
+        results_lock = threading.Lock()
+
+        def worker():
+            r = client.post("/decide", json=_cart_body("t_concurrent"), headers=headers)
+            with results_lock:
+                results.append(r.json())
+
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    assert call_count["n"] == 1, f"LLM was called {call_count['n']} times for 10 concurrent identical requests — idempotency lock failed to serialize them"
+    payment_links = {r.get("payment_link") for r in results}
+    assert len(payment_links) == 1, "all 10 concurrent requests must return the exact same result"
