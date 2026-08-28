@@ -11,6 +11,7 @@ Wraps the official SDK with:
 import os
 import hashlib
 import razorpay
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -58,11 +59,15 @@ def create_payment_link(*, amount_paise: int, description: str, session_id: str,
         payload["amount"] = -1
 
     try:
-        result = client.payment_link.create(payload)
+        result = client.payment_link.create(payload, timeout=15)
         return {"ok": True, "payment_link": result}
     except razorpay.errors.BadRequestError as e:
         return {"ok": False, "error_type": "bad_request", "error_message": str(e)}
     except razorpay.errors.ServerError as e:
         return {"ok": False, "error_type": "server_error", "error_message": str(e)}
+    except requests.exceptions.Timeout as e:
+        return {"ok": False, "error_type": "timeout", "error_message": str(e)}
+    except requests.exceptions.ConnectionError as e:
+        return {"ok": False, "error_type": "connection_error", "error_message": str(e)}
     except Exception as e:
         return {"ok": False, "error_type": "unknown", "error_message": str(e)}

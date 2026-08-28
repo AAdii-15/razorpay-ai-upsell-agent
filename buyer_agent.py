@@ -6,11 +6,20 @@ from app/, only speaks to the merchant over HTTP, exactly like a real
 third-party shopping agent would.
 
 This agent makes exactly ONE real LLM judgment call: translating a
-natural-language shopping brief from its principal into a concrete,
-bounded mandate (max_spend_paise, allowed_categories). Everything AFTER
-that point — accept, wait, or decline — is deliberately DETERMINISTIC,
-mirroring the same "know when not to use AI" principle applied on the
-merchant side (agent_gemini.py's should_call_agent()).
+natural-language shopping brief from its principal ("keep it budget
+friendly, only accessories or peripherals") into a concrete, bounded
+mandate (max_spend_paise, allowed_categories). That is a genuine judgment
+call — turning fuzzy human intent into a strict numeric policy.
+
+Everything AFTER that point — accept the offer, wait on human review, or
+decline because the offer breaks its own mandate — is deliberately
+DETERMINISTIC, not a second LLM call. Re-litigating a financial boundary
+with another model invocation every time a request gets a response is
+exactly the kind of decision that should NOT be delegated to an LLM: the
+boundary was set once, on purpose, with reasoning attached, and the agent
+doesn't get to argue itself past it after the fact. This mirrors the same
+"know when not to use AI" principle applied on the merchant side
+(agent_gemini.py's should_call_agent()) — now applied on the buyer side too.
 """
 
 import argparse
@@ -49,7 +58,8 @@ def log(msg: str) -> None:
 
 
 def derive_mandate_from_brief(brief: str, gemini_api_key: str, model: str) -> dict:
-    client = genai.Client(api_key=gemini_api_key)
+    """The one real LLM call this agent makes."""
+    client = genai.Client(api_key=gemini_api_key, http_options=types.HttpOptions(timeout=15000))
     response = client.models.generate_content(
         model=model,
         contents=f'Shopping brief from my principal: "{brief}"\n\nConvert this into a concrete spending mandate.',
@@ -113,7 +123,10 @@ def run_scenario(base_url: str, agent_id: str, session_id: str, items: list[dict
     status = data["status"]
     suggestion = data["suggestion"]
 
-    log(f"merchant's agent proposed: should_upsell={suggestion['should_upsell']}, sku={suggestion.get('sku')}, reasoning=\"{suggestion['reasoning']}\"")
+    if suggestion is not None:
+        log(f"merchant's agent proposed: should_upsell={suggestion['should_upsell']}, sku={suggestion.get('sku')}, reasoning=\"{suggestion['reasoning']}\"")
+    else:
+        log("merchant's agent could not be reached to make a suggestion at all.")
 
     if status == "no_action":
         log("decision: nothing offered, nothing to do. session complete.")
@@ -136,6 +149,10 @@ def run_scenario(base_url: str, agent_id: str, session_id: str, items: list[dict
         error = data.get("error", {})
         log(f"decision: offer was valid and approved, but the merchant's payment system failed to process it ({error.get('error_type')}: {error.get('error_message')}).")
         log("this is a merchant-side system failure, not a policy rejection — not retrying automatically, logging and moving on. session complete, no purchase made.")
+    elif status == "agent_call_failed":
+        error = data.get("error", {})
+        log(f"decision: the merchant's own AI reasoning was unavailable ({error.get('error_message')}) — no suggestion was even made.")
+        log("not retrying automatically — logging and moving on. session complete, no purchase made.")
     else:
         log(f"unexpected status '{status}' — failing safe, not acting on it.")
 

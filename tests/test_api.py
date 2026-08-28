@@ -141,6 +141,19 @@ def test_metrics_aggregate_correctly_across_sessions(client):
     assert m["auto_approved_and_charged"] == 1
 
 
+def test_llm_exception_fails_safe_instead_of_500(client):
+    """If the LLM call raises for any reason (timeout, rate limit, SDK
+    error), the request must still return a clean response, never an
+    unhandled crash."""
+    import main
+    with patch.object(main.agent_module, "decide_upsell") as mock_decide:
+        mock_decide.side_effect = TimeoutError("simulated LLM timeout")
+        r = client.post("/decide", json=_cart_body("t_agent_fail"))
+        assert r.status_code == 200
+        assert r.json()["status"] == "agent_call_failed"
+        assert "simulated LLM timeout" in r.json()["error"]["error_message"]
+
+
 def test_unknown_sku_in_cart_is_rejected(client):
     body = {"session_id": "t_badsku", "items": [{"sku": "sku_does_not_exist", "name": "x", "qty": 1, "price_paise": 100}]}
     r = client.post("/decide", json=body)

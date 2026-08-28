@@ -92,7 +92,20 @@ def _decide_core(req: DecideRequest) -> dict:
     cart = CartContext(session_id=req.session_id, items=req.items, customer_segment=req.customer_segment)
     decision_id = str(uuid.uuid4())
 
-    suggestion = agent_module.decide_upsell(cart, req.mandate)
+    try:
+        suggestion = agent_module.decide_upsell(cart, req.mandate)
+    except Exception as e:
+        audit.log_event(
+            req.session_id, "agent_call_failed", "system",
+            {"decision_id": decision_id, "error": str(e)},
+            reasoning="LLM call raised an exception (timeout, rate limit, or SDK error) -- failing safe with no upsell attempt instead of crashing the request.",
+        )
+        return {
+            "decision_id": decision_id, "status": "agent_call_failed",
+            "suggestion": None, "guardrail": None,
+            "error": {"error_type": "agent_unavailable", "error_message": str(e)},
+        }
+
     audit.log_event(
         req.session_id, "agent_decision", "agent",
         {"decision_id": decision_id, "suggestion": suggestion.model_dump(),
